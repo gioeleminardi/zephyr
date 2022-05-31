@@ -20,7 +20,8 @@ LOG_MODULE_REGISTER(MPU9250, CONFIG_SENSOR_LOG_LEVEL);
 
 
 #define MPU9250_REG_CHIP_ID		0x75
-#define MPU9250_CHIP_ID			0x71
+#define MPU9250_CHIP_ID 0x71
+#define MPU9250_CHIP_ID2 0x75
 
 #define MPU9250_REG_SR_DIV		0x19
 
@@ -252,7 +253,7 @@ static int mpu9250_init(const struct device *dev)
 		return ret;
 	}
 
-	if (id != MPU9250_CHIP_ID) {
+	if (id != MPU9250_CHIP_ID && id != MPU9250_CHIP_ID2) {
 		LOG_ERR("Invalid chip ID.");
 		return -ENOTSUP;
 	}
