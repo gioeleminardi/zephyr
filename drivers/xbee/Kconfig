@@ -1,0 +1,5 @@
+# XBee Driver
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig XBEE
+	bool "XBee Drivers"
