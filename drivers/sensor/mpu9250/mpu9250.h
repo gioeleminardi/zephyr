@@ -27,6 +27,11 @@ struct mpu9250_data {
 	int16_t gyro_z;
 	uint16_t gyro_sensitivity_x10;
 
+	float gyroBias[3];
+	float accelBias[3];
+	float magBias[3];
+	float magScale[3];
+
 #ifdef CONFIG_MPU9250_MAGN_EN
 	int16_t magn_x;
 	int16_t magn_scale_x;

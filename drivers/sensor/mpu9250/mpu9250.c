@@ -18,41 +18,61 @@
 
 LOG_MODULE_REGISTER(MPU9250, CONFIG_SENSOR_LOG_LEVEL);
 
+#define MPU9250_REG_CHIP_ID 0x75
+#define MPU9250_CHIP_ID 0x71
 
-#define MPU9250_REG_CHIP_ID		0x75
-#define MPU9250_CHIP_ID			0x71
+#define MPU9250_REG_SR_DIV 0x19
 
-#define MPU9250_REG_SR_DIV		0x19
+#define MPU9250_REG_CONFIG 0x1A
+#define MPU9250_GYRO_DLPF_MAX 7
 
-#define MPU9250_REG_CONFIG		0x1A
-#define MPU9250_GYRO_DLPF_MAX		7
-
-#define MPU9250_REG_GYRO_CFG		0x1B
-#define MPU9250_GYRO_FS_SHIFT		3
-#define MPU9250_GYRO_FS_MAX		3
+#define MPU9250_REG_GYRO_CFG 0x1B
+#define MPU9250_GYRO_FS_SHIFT 3
+#define MPU9250_GYRO_FS_MAX 3
 
 #define MPU9250_REG_ACCEL_CFG		0x1C
 #define MPU9250_ACCEL_FS_SHIFT		3
 #define MPU9250_ACCEL_FS_MAX		3
 
-#define MPU9250_REG_ACCEL_CFG2		0x1D
-#define MPU9250_ACCEL_DLPF_MAX		7
+#define MPU9250_REG_ACCEL_CFG2 0x1D
+#define MPU9250_ACCEL_DLPF_MAX 7
 
-#define MPU9250_REG_DATA_START		0x3B
+#define MPU9250_REG_DATA_START 0x3B
 
-#define MPU0259_TEMP_SENSITIVITY	334
-#define MPU9250_TEMP_OFFSET		21
+#define MPU0259_TEMP_SENSITIVITY 334
+#define MPU9250_TEMP_OFFSET 21
 
-#define MPU9250_REG_PWR_MGMT1		0x6B
-#define MPU9250_SLEEP_EN		BIT(6)
+#define MPU9250_REG_PWR_MGMT1 0x6B
+#define MPU9250_SLEEP_EN BIT(6)
+#define MPU9250_RESET BIT(7)
 
+#define MPU9250_REG_PWR_MGMT2 0x6C
+
+#define MPU9250_REG_INT_ENABLE 0x38
+#define MPU9250_REG_FIFO_EN 0x23
+#define MPU9250_REG_I2C_MST_CTRL 0x24
+#define MPU9250_REG_USER_CTRL 0x6A
+#define MPU9250_REG_FIFO_COUNTH 0x72
+#define MPU9250_REG_FIFO_COUNTL 0x73
+#define MPU9250_REG_FIFO_R_W 0x74
+#define MPU9250_REG_XG_OFFSET_H 0x13 // User-defined trim values for gyroscope
+#define MPU9250_REG_XG_OFFSET_L 0x14
+#define MPU9250_REG_YG_OFFSET_H 0x15
+#define MPU9250_REG_YG_OFFSET_L 0x16
+#define MPU9250_REG_ZG_OFFSET_H 0x17
+#define MPU9250_REG_ZG_OFFSET_L 0x18
+#define MPU9250_REG_XA_OFFSET_H 0x77
+#define MPU9250_REG_XA_OFFSET_L 0x78
+#define MPU9250_REG_YA_OFFSET_H 0x7A
+#define MPU9250_REG_YA_OFFSET_L 0x7B
+#define MPU9250_REG_ZA_OFFSET_H 0x7D
+#define MPU9250_REG_ZA_OFFSET_L 0x7E
 
 #ifdef CONFIG_MPU9250_MAGN_EN
 #define MPU9250_READ_BUF_SIZE 11
 #else
 #define MPU9250_READ_BUF_SIZE 7
 #endif
-
 
 /* see "Accelerometer Measurements" section from register map description */
 static void mpu9250_convert_accel(struct sensor_value *val, int16_t raw_val,
@@ -220,6 +240,283 @@ static int mpu9250_sample_fetch(const struct device *dev,
 	return 0;
 }
 
+static int mpu9250_calibrate(const struct device *dev)
+{
+	struct mpu9250_data *drv_data = dev->data;
+	const struct mpu9250_config *cfg = dev->config;
+
+	uint8_t calibData[12]; // data array to hold accelerometer and gyro x, y, z, data
+	uint16_t ii, packet_count, fifo_count;
+	int32_t gyro_bias[3] = { 0, 0, 0 }, accel_bias[3] = { 0, 0, 0 };
+
+	int ret = i2c_reg_update_byte_dt(&cfg->i2c, MPU9250_REG_PWR_MGMT1, MPU9250_RESET, 1);
+	if (ret < 0) {
+		LOG_ERR("Failed to reset.");
+		return ret;
+	}
+
+	k_sleep(K_MSEC(100));
+
+	// get stable time source; Auto select clock source to be PLL gyroscope reference if ready
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_PWR_MGMT1, 0x01);
+	if (ret < 0) {
+		LOG_ERR("Failed to set PLL1.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_PWR_MGMT2, 0x00);
+	if (ret < 0) {
+		LOG_ERR("Failed to set PLL2.");
+		return ret;
+	}
+
+	k_sleep(K_MSEC(200));
+
+	// Configure device for bias calculation
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_INT_ENABLE,
+				    0x00); // Disable all interrupts
+	if (ret < 0) {
+		LOG_ERR("Failed to Disable all interrupts.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_FIFO_EN, 0x00); // Disable FIFO
+	if (ret < 0) {
+		LOG_ERR("Failed to Disable FIFO");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_PWR_MGMT1,
+				    0x00); // Turn on internal clock source
+	if (ret < 0) {
+		LOG_ERR("Failed to Turn on internal clock source.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_I2C_MST_CTRL,
+				    0x00); // Disable I2C master
+	if (ret < 0) {
+		LOG_ERR("Failed to Disable I2C master.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_USER_CTRL,
+				    0x00); // Disable FIFO and I2C master modes
+	if (ret < 0) {
+		LOG_ERR("Failed to Disable FIFO and I2C master modes.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_USER_CTRL, 0x0C); // Reset FIFO and DMP
+	if (ret < 0) {
+		LOG_ERR("Failed to Reset FIFO and DMP.");
+		return ret;
+	}
+
+	k_sleep(K_MSEC(15));
+
+	// Configure MPU6050 gyro and accelerometer for bias calculation
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_CONFIG,
+				    0x01); // Set low-pass filter to 188 Hz
+	if (ret < 0) {
+		LOG_ERR("Failed to Set low-pass filter to 188 Hz.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_SR_DIV,
+				    0x00); // Set sample rate to 1 kHz
+	if (ret < 0) {
+		LOG_ERR("Failed to Set sample rate to 1 kHz.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(
+		&cfg->i2c, MPU9250_REG_GYRO_CFG,
+		0x00); // Set gyro full-scale to 250 degrees per second, maximum sensitivity
+	if (ret < 0) {
+		LOG_ERR("Failed to Set gyro full-scale to 250 degrees per second, maximum sensitivity.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(
+		&cfg->i2c, MPU9250_REG_ACCEL_CFG,
+		0x00); // Set accelerometer full-scale to 2 g, maximum sensitivity
+	if (ret < 0) {
+		LOG_ERR("Failed to Set accelerometer full-scale to 2 g, maximum sensitivity.");
+		return ret;
+	}
+
+	uint16_t gyrosensitivity = 131; // = 131 LSB/degrees/sec
+	uint16_t accelsensitivity = 16384; // = 16384 LSB/g
+
+	// Configure FIFO to capture accelerometer and gyro data for bias calculation
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_USER_CTRL, 0x40); // Enable FIFO
+	if (ret < 0) {
+		LOG_ERR("Failed to Enable FIFO.");
+		return ret;
+	}
+	ret = i2c_reg_write_byte_dt(
+		&cfg->i2c, MPU9250_REG_FIFO_EN,
+		0x78); // Enable gyro and accelerometer sensors for FIFO  (max size 512 bytes in MPU-9150)
+	if (ret < 0) {
+		LOG_ERR("Failed to Enable gyro and accelerometer sensors for FIFO.");
+		return ret;
+	}
+	k_sleep(K_MSEC(40)); // accumulate 40 samples in 40 milliseconds = 480 bytes
+
+	// At end of sample accumulation, turn off FIFO sensor read
+	ret = i2c_reg_write_byte_dt(&cfg->i2c, MPU9250_REG_FIFO_EN,
+				    0x00); // Disable gyro and accelerometer sensors for FIFO
+	if (ret < 0) {
+		LOG_ERR("Failed to Disable gyro and accelerometer sensors for FIFO.");
+		return ret;
+	}
+	ret = i2c_burst_read_dt(&cfg->i2c, MPU9250_REG_FIFO_COUNTH, &calibData[0],
+				2); // read FIFO sample count
+	if (ret < 0) {
+		LOG_ERR("Failed to read FIFO sample count.");
+		return ret;
+	}
+
+	fifo_count = ((uint16_t)calibData[0] << 8) | calibData[1];
+	packet_count =
+		fifo_count / 12; // How many sets of full gyro and accelerometer data for averaging
+
+	for (ii = 0; ii < packet_count; ii++) {
+		int16_t accel_temp[3] = { 0, 0, 0 }, gyro_temp[3] = { 0, 0, 0 };
+		ret = i2c_burst_read_dt(&cfg->i2c, MPU9250_REG_FIFO_R_W, &calibData[0], 12);
+		if (ret < 0) {
+			LOG_ERR("Failed to read calib data from FIFO.");
+			return ret;
+		}
+
+		//Form signed 16-bit integer for each sample in FIFO
+		accel_temp[0] = (int16_t)(((int16_t)calibData[0] << 8) | calibData[1]);
+		accel_temp[1] = (int16_t)(((int16_t)calibData[2] << 8) | calibData[3]);
+		accel_temp[2] = (int16_t)(((int16_t)calibData[4] << 8) | calibData[5]);
+		gyro_temp[0] = (int16_t)(((int16_t)calibData[6] << 8) | calibData[7]);
+		gyro_temp[1] = (int16_t)(((int16_t)calibData[8] << 8) | calibData[9]);
+		gyro_temp[2] = (int16_t)(((int16_t)calibData[10] << 8) | calibData[11]);
+
+		//Sum individual signed 16-bit biases to get accumulated signed 32-bit biases
+		accel_bias[0] += (int32_t)accel_temp[0];
+		accel_bias[1] += (int32_t)accel_temp[1];
+		accel_bias[2] += (int32_t)accel_temp[2];
+		gyro_bias[0] += (int32_t)gyro_temp[0];
+		gyro_bias[1] += (int32_t)gyro_temp[1];
+		gyro_bias[2] += (int32_t)gyro_temp[2];
+	}
+
+	//Normalize sums to get average count biases
+	accel_bias[0] /= (int32_t)packet_count;
+	accel_bias[1] /= (int32_t)packet_count;
+	accel_bias[2] /= (int32_t)packet_count;
+	gyro_bias[0] /= (int32_t)packet_count;
+	gyro_bias[1] /= (int32_t)packet_count;
+	gyro_bias[2] /= (int32_t)packet_count;
+
+	//Remove gravity from the z-axis accelerometer bias calculation
+	if (accel_bias[2] > 0L) {
+		accel_bias[2] -= (int32_t)accelsensitivity;
+	} else {
+		accel_bias[2] += (int32_t)accelsensitivity;
+	}
+
+	//Construct the gyro biases for push to the hardware gyro bias registers, which are reset to zero upon device startup
+	calibData[0] =
+		(-gyro_bias[0] / 4 >> 8) &
+		0xFF; // Divide by 4 to get 32.9 LSB per deg/s to conform to expected bias input format
+	calibData[1] =
+		(-gyro_bias[0] / 4) &
+		0xFF; // Biases are additive, so change sign on calculated average gyro biases
+	calibData[2] = (-gyro_bias[1] / 4 >> 8) & 0xFF;
+	calibData[3] = (-gyro_bias[1] / 4) & 0xFF;
+	calibData[4] = (-gyro_bias[2] / 4 >> 8) & 0xFF;
+	calibData[5] = (-gyro_bias[2] / 4) & 0xFF;
+
+	//Push gyro biases to hardware registers
+	ret = i2c_burst_read_dt(&cfg->i2c, MPU9250_REG_XG_OFFSET_H, &calibData[0], 6);
+	if (ret < 0) {
+		LOG_ERR("Failed to Push gyro biases to hardware registers.");
+		return ret;
+	}
+
+	drv_data->gyroBias[0] = (float)gyro_bias[0] / (float)gyrosensitivity;
+	drv_data->gyroBias[1] = (float)gyro_bias[1] / (float)gyrosensitivity;
+	drv_data->gyroBias[2] = (float)gyro_bias[2] / (float)gyrosensitivity;
+
+	LOG_DBG("Gyro bias X: %f, Gyro bias Y: %f, Gyro bias Z: %f", drv_data->gyroBias[0],
+		drv_data->gyroBias[1], drv_data->gyroBias[2]);
+
+	//Construct the accelerometer biases for push to the hardware accelerometer bias registers.
+	int32_t accel_bias_reg[3] = { 0, 0,
+				      0 }; //A place to hold the factory accelerometer trim biases
+
+	ret = i2c_burst_read_dt(&cfg->i2c, MPU9250_REG_XA_OFFSET_H, &calibData[0],
+				2); //Read factory accelerometer trim values
+	if (ret < 0) {
+		LOG_ERR("Failed to Read factory accelerometer trim values.");
+		return ret;
+	}
+	accel_bias_reg[0] = (int32_t)(((int16_t)calibData[0] << 8) | calibData[1]);
+
+	ret = i2c_burst_read_dt(&cfg->i2c, MPU9250_REG_YA_OFFSET_H, &calibData[0], 2);
+	if (ret < 0) {
+		LOG_ERR("Failed to Read factory accelerometer trim values.");
+		return ret;
+	}
+	accel_bias_reg[1] = (int32_t)(((int16_t)calibData[0] << 8) | calibData[1]);
+
+	ret = i2c_burst_read_dt(&cfg->i2c, MPU9250_REG_ZA_OFFSET_H, &calibData[0], 2);
+	if (ret < 0) {
+		LOG_ERR("Failed to Read factory accelerometer trim values.");
+		return ret;
+	}
+	accel_bias_reg[2] = (int32_t)(((int16_t)calibData[0] << 8) | calibData[1]);
+
+	//Define mask for temperature compensation bit 0 of lower byte of accelerometer bias registers
+	uint32_t mask = 1uL;
+	//Define array to hold mask bit for each accelerometer bias axis
+	uint8_t mask_bit[3] = { 0, 0, 0 };
+
+	for (ii = 0; ii < 3; ii++) {
+		//If temperature compensation bit is set, record that fact in mask_bit
+		if ((accel_bias_reg[ii] & mask))
+			mask_bit[ii] = 0x01;
+	}
+
+	//Construct total accelerometer bias, including calculated average accelerometer bias from above
+	accel_bias_reg[0] -=
+		(accel_bias[0] /
+		 8); //Subtract calculated averaged accelerometer bias scaled to 2048 LSB/g (16 g full scale)
+	accel_bias_reg[1] -= (accel_bias[1] / 8);
+	accel_bias_reg[2] -= (accel_bias[2] / 8);
+
+	calibData[0] = (accel_bias_reg[0] >> 8) & 0xFF;
+	calibData[1] = (accel_bias_reg[0]) & 0xFF;
+	calibData[1] =
+		calibData[1] |
+		mask_bit[0]; // preserve temperature compensation bit when writing back to accelerometer bias registers
+	calibData[2] = (accel_bias_reg[1] >> 8) & 0xFF;
+	calibData[3] = (accel_bias_reg[1]) & 0xFF;
+	calibData[3] =
+		calibData[3] |
+		mask_bit[1]; // preserve temperature compensation bit when writing back to accelerometer bias registers
+	calibData[4] = (accel_bias_reg[2] >> 8) & 0xFF;
+	calibData[5] = (accel_bias_reg[2]) & 0xFF;
+	calibData[5] =
+		calibData[5] |
+		mask_bit[2]; // preserve temperature compensation bit when writing back to accelerometer bias registers
+
+	//Push accelerometer biases to hardware registers
+	ret = i2c_burst_read_dt(&cfg->i2c, MPU9250_REG_XA_OFFSET_H, &calibData[0], 6);
+	if (ret < 0) {
+		LOG_ERR("Failed to Push accelerometer biases to hardware registers.");
+		return ret;
+	}
+
+	//Output scaled gyro biases for display in the main program
+	drv_data->accelBias[0] = (float)accel_bias[0] / (float)accelsensitivity;
+	drv_data->accelBias[1] = (float)accel_bias[1] / (float)accelsensitivity;
+	drv_data->accelBias[2] = (float)accel_bias[2] / (float)accelsensitivity;
+
+	LOG_DBG("Accel bias X: %f, Accel bias Y: %f, Accel bias Z: %f", drv_data->accelBias[0],
+		drv_data->accelBias[1], drv_data->accelBias[2]);
+
+	return 0;
+}
+
 static const struct sensor_driver_api mpu9250_driver_api = {
 #if CONFIG_MPU9250_TRIGGER
 	.trigger_set = mpu9250_trigger_set,
@@ -257,10 +554,14 @@ static int mpu9250_init(const struct device *dev)
 		return -ENOTSUP;
 	}
 
+	// TODO: calibrate
+	ret = mpu9250_calibrate(dev);
+	if (ret < 0) {
+		LOG_ERR("Failed to calibrate.");
+	}
+
 	/* wake up chip */
-	ret = i2c_reg_update_byte_dt(&cfg->i2c,
-				     MPU9250_REG_PWR_MGMT1,
-				     MPU9250_SLEEP_EN, 0);
+	ret = i2c_reg_update_byte_dt(&cfg->i2c, MPU9250_REG_PWR_MGMT1, MPU9250_SLEEP_EN, 0);
 	if (ret < 0) {
 		LOG_ERR("Failed to wake up chip.");
 		return ret;
